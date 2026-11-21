@@ -138,10 +138,7 @@ A1="$(tunnel new step-one --to codex)"
 A2="$(tunnel new step-two --to codex)"
 sed -i.bak "s/^depends_on: none/depends_on: $(basename "$A1" .task.md)/" "$A2"
 check "dispatch dry-run plans 2 waves" sh -c "tunnel dispatch --dry-run '$A2' '$A1' | grep 'wave 2' >/dev/null"
-if [ -n "${CI:-}" ] && ! tmo 20 tunnel dispatch --dry-run "$A2" "$A1" >/dev/null 2>&1; then
-  echo "---- trace (CI debug) ----"; bash --version | head -1; command -v bash
-  tmo 10 bash -x "$(command -v tunnel)" dispatch --dry-run "$A2" "$A1" 2>&1 | head -120
-fi
+check "dispatch stops when its reader goes away" sh -c "trap '' PIPE; tunnel dispatch --dry-run '$A2' '$A1' | head -1 >/dev/null"
 check "dispatch runs in order" tunnel dispatch "$A2" "$A1"
 check "flow init" tunnel flow init "Demo" s1:"Plan" s2:"Build"
 check "flow step" tunnel flow step s1 done "planned"

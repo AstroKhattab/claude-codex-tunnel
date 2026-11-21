@@ -53,6 +53,10 @@ json() { # json <python-expr-using-a> args...  -> prints JSON built in python
 
 bus() { printf '%s\n' "$1" >> "$STATE/bus.jsonl"; }
 
+# Print, or stop if nobody is reading any more (e.g. `tunnel dispatch ... | head`).
+# Where SIGPIPE is ignored, a failed write would otherwise be silently skipped.
+out() { printf '%s\n' "$*" 2>/dev/null || exit 141; }
+
 notify() { # notify <title> <message> [sound]
   [ "${TUNNEL_NOTIFY:-1}" = "0" ] && return 0
   local t="${1//\"/\'}" m="${2//\"/\'}" s="${3:-}"
@@ -524,11 +528,11 @@ EOF
     if [ -z "$(printf '%s' "$ready" | tr -d '[:space:]')" ]; then
       info "✗ wave $wave: nothing can run — unmet or failed dependencies:"; info "$blocked"; return 1
     fi
-    echo "── wave $wave ──"
+    out "── wave $wave ──"
     local n=0
     while IFS= read -r t; do
       [ -n "$t" ] || continue
-      echo "   $(front to "$t")  <-  $(task_id "$t")"
+      out "   $(front to "$t")  <-  $(task_id "$t")"
       planned="$planned $(task_id "$t")"
       [ "$dry" = 1 ] && continue
       "$SELF" run "$t" >/dev/null 2>&1 &
@@ -541,7 +545,7 @@ EOF
     local halt=0 i v
     while IFS= read -r t; do
       [ -n "$t" ] || continue
-      i="$(task_id "$t")"; v="$(verdict_of "$i")"; echo "   $i -> $v"
+      i="$(task_id "$t")"; v="$(verdict_of "$i")"; out "   $i -> $v"
       case "$v" in DONE|APPROVE) ;; *) halt=1 ;; esac
     done <<EOF
 $ready
@@ -549,7 +553,7 @@ EOF
     [ "$halt" = 1 ] && { info "✗ halted: a task returned REVISE/BLOCK/FAILED. Read the reports and decide."; return 1; }
     remaining="$blocked"
   done
-  echo "✓ all tasks DONE/APPROVE"
+  if [ "$dry" = 1 ]; then out "(dry run: nothing was started)"; else out "✓ all tasks DONE/APPROVE"; fi
 }
 
 # ── flow (workflow steps shown on the board) ────────────────────────────────
