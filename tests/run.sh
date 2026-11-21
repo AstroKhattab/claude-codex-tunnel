@@ -14,7 +14,7 @@ export PATH="$T/fakebin:$HOME/.local/bin:$PATH"
 
 pass=0; fail=0
 # Every check has a time limit, so a bug shows up as a failure, never a hang.
-tmo() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+tmo() { perl -e 'alarm shift; exec { $ARGV[0] } @ARGV or exit 127' "$@"; }
 check() { # check <name> <command...>
   local name="$1"; shift
   if tmo "${CHECK_TIMEOUT:-60}" "$@" >/dev/null 2>&1; then pass=$((pass+1)); echo "  ✓ $name"
