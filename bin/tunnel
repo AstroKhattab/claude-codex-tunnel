@@ -359,7 +359,7 @@ cmd_run() {
   local caller=you
   if [ -n "${TUNNEL_ENGINE:-}" ]; then caller="$TUNNEL_ENGINE"
   elif [ "${CLAUDECODE:-}" = 1 ]; then caller=claude
-  elif env | grep -v '^CODEX_HOME=' | grep -q '^CODEX_'; then caller=codex
+  elif env | grep -v '^CODEX_HOME=' | grep '^CODEX_' >/dev/null; then caller=codex  # no -q: an early exit breaks pipefail
   fi
 
   bus "$(json '{"ts":a[0],"event":"start","run":a[1],"agent":a[2],"title":a[3],"role":a[4],"task":a[5],"brief":a[6],"sandbox":a[7],"resumed":a[8]=="1","goal":a[9],"depth":int(a[10]),"from":a[11]}' \
@@ -652,7 +652,7 @@ cmd_doctor() {
       local -a ca=(exec --sandbox read-only --skip-git-repo-check)
       [ -n "${TUNNEL_CODEX_MODEL:-}" ] && ca+=(-m "$TUNNEL_CODEX_MODEL")
       out="$(echo "Reply with exactly: TUNNEL-OK" | codex "${ca[@]}" - 2>&1)"
-      if printf '%s' "$out" | grep -q 'TUNNEL-OK'; then ok "codex answered"
+      if case "$out" in *TUNNEL-OK*) true ;; *) false ;; esac; then ok "codex answered"
       else fail "codex did not answer: $(printf '%s' "$out" | grep -iE 'error|not supported|login' | head -2 | cut -c1-200)"
            printf '      if the model is the problem, set TUNNEL_CODEX_MODEL to one your plan allows\n'; fi
     fi
@@ -660,7 +660,7 @@ cmd_doctor() {
       local -a la=(-p)
       [ -n "${TUNNEL_CLAUDE_MODEL:-}" ] && la+=(--model "$TUNNEL_CLAUDE_MODEL")
       out="$(echo "Reply with exactly: TUNNEL-OK" | claude "${la[@]}" 2>&1)"
-      if printf '%s' "$out" | grep -q 'TUNNEL-OK'; then ok "claude answered"
+      if case "$out" in *TUNNEL-OK*) true ;; *) false ;; esac; then ok "claude answered"
       else fail "claude did not answer: $(printf '%s' "$out" | head -2 | cut -c1-200)"; fi
     fi
   fi
