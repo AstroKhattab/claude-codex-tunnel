@@ -13,9 +13,11 @@ mkdir -p "$HOME" "$T/fakebin"
 export PATH="$T/fakebin:$HOME/.local/bin:$PATH"
 
 pass=0; fail=0
+# Every check has a time limit, so a bug shows up as a failure, never a hang.
+tmo() { perl -e 'alarm shift; exec @ARGV' "$@"; }
 check() { # check <name> <command...>
   local name="$1"; shift
-  if "$@" >/dev/null 2>&1; then pass=$((pass+1)); echo "  ✓ $name"
+  if tmo "${CHECK_TIMEOUT:-60}" "$@" >/dev/null 2>&1; then pass=$((pass+1)); echo "  ✓ $name"
   else fail=$((fail+1)); echo "  ✗ $name"; fi
 }
 
@@ -135,7 +137,11 @@ echo "dispatch, flow, status"
 A1="$(tunnel new step-one --to codex)"
 A2="$(tunnel new step-two --to codex)"
 sed -i.bak "s/^depends_on: none/depends_on: $(basename "$A1" .task.md)/" "$A2"
-check "dispatch dry-run plans 2 waves" sh -c "tunnel dispatch --dry-run '$A2' '$A1' | grep -q 'wave 2'"
+check "dispatch dry-run plans 2 waves" sh -c "tunnel dispatch --dry-run '$A2' '$A1' | grep 'wave 2' >/dev/null"
+if [ -n "${CI:-}" ] && ! tmo 20 tunnel dispatch --dry-run "$A2" "$A1" >/dev/null 2>&1; then
+  echo "---- trace (CI debug) ----"; bash --version | head -1; command -v bash
+  tmo 10 bash -x "$(command -v tunnel)" dispatch --dry-run "$A2" "$A1" 2>&1 | head -120
+fi
 check "dispatch runs in order" tunnel dispatch "$A2" "$A1"
 check "flow init" tunnel flow init "Demo" s1:"Plan" s2:"Build"
 check "flow step" tunnel flow step s1 done "planned"
