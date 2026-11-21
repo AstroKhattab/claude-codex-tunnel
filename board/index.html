@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tunnel board</title>
+<style>
+  /* Self-contained by design: no CDN, no font, no image, no build step. It has to
+     render on a laptop with no network, inside any CSP, from any repo. */
+  :root{
+    --bg:#0b0d10; --panel:#12151a; --panel2:#171b21; --line:#232a33;
+    --ink:#e6edf3; --dim:#8b98a5; --faint:#5b6672;
+    --todo:#39424e; --doing:#2f81f7; --done:#2ea043; --blocked:#f85149; --warn:#d29922;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{position:sticky;top:0;z-index:20;background:var(--panel);
+    border-bottom:1px solid var(--line);padding:10px 16px;
+    display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  h1{font-size:14px;margin:0;letter-spacing:.1em}
+  .pulse{width:8px;height:8px;border-radius:50%;background:var(--done);
+    animation:blink 1s steps(2,start) infinite}
+  .pulse.stale{background:var(--blocked);animation:none}
+  @keyframes blink{to{visibility:hidden}}
+  .grow{flex:1}.faint{color:var(--faint)}.dim{color:var(--dim)}
+  main{padding:14px;display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(400px,1fr))}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;min-width:0}
+  section.wide{grid-column:1/-1}
+  h2{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin:0 0 10px;font-weight:600}
+
+  /* ── workflow stepper ─────────────────────────────────────────────── */
+  .flow{display:flex;gap:0;flex-wrap:wrap;align-items:stretch}
+  .stepwrap{display:flex;align-items:center;flex:1 1 130px;min-width:130px}
+  .step{flex:1;border:1px solid var(--line);border-left-width:4px;border-radius:6px;
+    padding:8px 10px;background:var(--panel2);min-width:0}
+  .step .lbl{font-weight:700;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .step .st{font-size:10px;letter-spacing:.1em;text-transform:uppercase;margin-top:2px}
+  .step .dt{font-size:11px;color:var(--faint);margin-top:4px;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .step.todo   {border-left-color:var(--todo)}    .step.todo .st{color:var(--faint)}
+  .step.doing  {border-left-color:var(--doing);background:#0c1a2e;box-shadow:0 0 0 1px #17395f inset}
+  .step.doing .st{color:var(--doing)}
+  .step.done   {border-left-color:var(--done)}    .step.done .st{color:var(--done)}
+  .step.blocked{border-left-color:var(--blocked);background:#1d1113} .step.blocked .st{color:var(--blocked)}
+  .arrow{color:var(--line);padding:0 4px;flex:none}
+
+  /* ── agents ───────────────────────────────────────────────────────── */
+  .agents{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+  .agent{border:1px solid var(--line);border-radius:6px;padding:9px 11px;background:var(--panel2)}
+  .agent.live{border-color:#17395f;background:#0c1a2e}
+  .agent .n{font-weight:700}
+  .agent .t{color:var(--dim);font-size:12px;margin-top:1px}
+  .agent .d{color:var(--faint);font-size:11.5px;margin-top:5px;
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+  .spin{display:inline-block;width:8px;height:8px;margin-right:6px;border-radius:50%;
+    border:2px solid var(--doing);border-top-color:transparent;animation:sp .8s linear infinite;vertical-align:middle}
+  @keyframes sp{to{transform:rotate(360deg)}}
+
+  /* ── conversation ─────────────────────────────────────────────────── */
+  .convo{max-height:460px;overflow:auto}
+  .msg{border-left:3px solid var(--line);padding:6px 10px;margin-bottom:8px}
+  .msg.out{border-left-color:var(--doing)}
+  .msg.in {border-left-color:var(--done)}
+  .msg.in.bad{border-left-color:var(--blocked)}
+  .msg.in.ask{border-left-color:var(--warn)}
+  .msg .h{font-size:11px;color:var(--dim);margin-bottom:3px}
+  .msg .b{white-space:pre-wrap;word-break:break-word;font-size:12px}
+  .msg .f{margin-top:5px;font-size:11px;color:var(--faint)}
+  .msg .f code{background:#1b2027;padding:1px 5px;border-radius:3px;margin-right:4px;display:inline-block}
+
+  table{width:100%;border-collapse:collapse}
+  td,th{padding:5px 6px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+  th{color:var(--faint);font-weight:600;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase}
+  tr:last-child td{border-bottom:0}
+  .scroll{max-height:320px;overflow:auto}
+  .chip{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;border:1px solid var(--line);color:var(--dim);white-space:nowrap}
+  .chip.ok{background:#0d2b16;color:var(--done);border-color:#1a4429}
+  .chip.bad{background:#2d1214;color:var(--blocked);border-color:#4a1d20}
+  .chip.warn{background:#2b2410;color:var(--warn);border-color:#4a3c17}
+  .chip.run{background:#0c2440;color:var(--doing);border-color:#17395f}
+  .ask{background:#2b2410;border:1px solid #4a3c17;border-radius:6px;padding:9px 12px;margin-bottom:10px;color:var(--warn)}
+  .empty{color:var(--faint);padding:10px 2px}
+  .big{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+  .stat{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+  .stat b{display:block;font-size:22px;line-height:1.15}
+  .stat span{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+</style>
+</head>
+<body>
+
+<header>
+  <span class="pulse" id="pulse"></span>
+  <h1 id="title">Claude ⇄ Codex tunnel</h1>
+  <span class="chip" id="phase">–</span>
+  <span class="grow"></span>
+  <span class="faint" id="clock">–</span>
+</header>
+
+<main>
+  <section class="wide">
+    <h2>Workflow</h2>
+    <div class="flow" id="flow"></div>
+  </section>
+
+  <section class="wide">
+    <div id="askBanner"></div>
+    <div class="big">
+      <div class="stat"><b id="sRun" style="color:var(--doing)">0</b><span>Running</span></div>
+      <div class="stat"><b id="sDone" style="color:var(--done)">0</b><span>Tasks done</span></div>
+      <div class="stat"><b id="sBad" style="color:var(--blocked)">0</b><span>Revise / block</span></div>
+      <div class="stat"><b id="sAsk" style="color:var(--warn)">0</b><span>Open questions</span></div>
+    </div>
+  </section>
+
+  <section class="wide">
+    <h2>Agents</h2>
+    <div class="agents" id="agents"></div>
+  </section>
+
+  <section class="wide">
+    <h2>Conversation — orchestrator ⇄ agents</h2>
+    <div class="convo" id="convo"></div>
+  </section>
+
+  <section class="wide">
+    <h2>Task log</h2>
+    <div class="scroll"><table>
+      <thead><tr>
+        <th style="width:60px">Agent</th><th style="width:190px">Task</th><th>Title</th>
+        <th style="width:80px">Verdict</th><th style="width:54px">Time</th>
+        <th style="width:260px">Files touched</th><th style="width:52px">When</th>
+      </tr></thead>
+      <tbody id="tasks"></tbody>
+    </table></div>
+  </section>
+</main>
+
+<script>
+// Two files, polled once a second. pipeline.json is the workflow; bus.jsonl is
+// append-only truth. Everything on this page is derived from those — there is no
+// third source that can disagree with them.
+const POLL_MS = 1000;
+const esc = s => String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const ago = iso => {
+  if(!iso) return '–';
+  const s = Math.max(0, Math.round((Date.now()-new Date(iso).getTime())/1000));
+  return s<60 ? s+'s' : s<3600 ? Math.round(s/60)+'m' : Math.round(s/3600)+'h';
+};
+const dur = n => n==null ? '' : n<60 ? n+'s' : Math.floor(n/60)+'m'+(n%60?(n%60)+'s':'');
+
+async function jsonOr(url, fallback){
+  try{ const r = await fetch(url+'?t='+Date.now(), {cache:'no-store'}); if(!r.ok) return fallback; return await r.json(); }
+  catch{ return fallback; }
+}
+async function linesOf(url){
+  try{ const r = await fetch(url+'?t='+Date.now(), {cache:'no-store'}); if(!r.ok) return [];
+       const t = await r.text(); return t.trim() ? t.trim().split('\n') : []; }
+  catch{ return []; }
+}
+
+function renderFlow(p){
+  const steps = (p && p.steps) || [];
+  document.getElementById('flow').innerHTML = steps.length ? steps.map((s,i) => `
+    <div class="stepwrap">
+      <div class="step ${esc(s.status||'todo')}" title="${esc(s.detail||'')}">
+        <div class="lbl">${esc(s.label||s.id)}</div>
+        <div class="st">${esc(s.status||'todo')}</div>
+        ${s.detail ? `<div class="dt">${esc(s.detail)}</div>` : ''}
+      </div>
+      ${i < steps.length-1 ? '<span class="arrow">›</span>' : ''}
+    </div>`).join('')
+    : '<div class="empty">no pipeline yet — run: tunnel flow init "Title" s1:"Step one" s2:"Step two"</div>';
+
+  const doing = steps.find(s => s.status === 'doing');
+  const blocked = steps.find(s => s.status === 'blocked');
+  const phase = document.getElementById('phase');
+  const cur = blocked || doing;
+  phase.textContent = cur ? `${cur.status}: ${cur.label||cur.id}`
+    : (steps.length && steps.every(s=>s.status==='done') ? 'all steps done' : 'idle');
+  phase.className = 'chip ' + (blocked ? 'bad' : doing ? 'run' : steps.length ? 'ok' : '');
+  if (p && p.title) document.getElementById('title').textContent = p.title;
+}
+
+/** Fold the append-only bus into runs. running = a start with no matching end. */
+function foldRuns(bus){
+  const rows = bus.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const ended = new Set(rows.filter(r => r.event === 'end').map(r => r.run));
+  const runs = new Map();
+  for (const r of rows) {
+    if (r.event !== 'start' && r.event !== 'end') continue;
+    if (!r.run) continue;
+    runs.set(r.run, { ...(runs.get(r.run)||{}), ...r, running: !ended.has(r.run) });
+  }
+  return { rows, runs: [...runs.values()] };
+}
+
+function renderAgents(runs){
+  const live = runs.filter(r => r.running);
+  const recent = runs.filter(r => !r.running).slice(-4).reverse();
+  const card = (r) => `
+    <div class="agent ${r.running?'live':''}">
+      <div class="n">${r.running?'<span class="spin"></span>':''}${esc(r.agent)}
+        <span class="faint">${esc(r.role||'')}</span></div>
+      <div class="t">${esc(r.title||r.task||'')}</div>
+      <div class="d">${esc(r.running ? (r.goal||'working…') : (r.question || r.goal || ''))}</div>
+      <div class="faint" style="margin-top:5px">
+        ${r.running ? 'started '+ago(r.ts) : (r.verdict||'')+' · '+dur(r.secs)} ·
+        ${esc(r.sandbox||'')}${r.resumed?' · resumed':''}</div>
+    </div>`;
+  document.getElementById('agents').innerHTML =
+    (live.length ? live.map(card).join('') : '') +
+    (recent.length ? recent.map(card).join('') : '') ||
+    '<div class="empty">no agent has run yet</div>';
+}
+
+function renderConvo(rows, runs){
+  const byRun = Object.fromEntries(runs.map(r => [r.run, r]));
+  const items = [];
+  for (const r of rows) {
+    if (r.event === 'start') {
+      items.push({ ts:r.ts, cls:'out', who:`orchestrator → ${r.agent}`,
+        body:r.goal || '(no goal line)', foot:r.brief ? [r.brief] : [] });
+    } else if (r.event === 'end') {
+      const bad = r.rc !== 0 || ['REVISE','BLOCK','FAILED'].includes(r.verdict);
+      items.push({ ts:r.ts, cls:'in'+(r.asked?' ask':(bad?' bad':'')),
+        who:`${r.agent} → orchestrator · ${r.verdict||'?'}`,
+        body:(r.asked ? '❓ '+r.question : (r.question || 'completed')) ,
+        foot:[r.report, ...((r.files)||[])] });
+    } else if (r.event === 'say') {
+      items.push({ ts:r.ts, cls:'out', who:`orchestrator → ${r.to}`, body:r.text, foot:[] });
+    } else if (r.event === 'note') {
+      items.push({ ts:r.ts, cls:'', who:'orchestrator note', body:r.text, foot:[] });
+    } else if (r.event === 'step') {
+      items.push({ ts:r.ts, cls:'', who:`step ${r.step} → ${r.status}`, body:r.detail||'', foot:[] });
+    }
+  }
+  document.getElementById('convo').innerHTML = items.length
+    ? items.slice(-60).reverse().map(m => `
+      <div class="msg ${m.cls}">
+        <div class="h">${esc((m.ts||'').slice(11,19))} · ${esc(m.who)}</div>
+        <div class="b">${esc(m.body)}</div>
+        ${m.foot.filter(Boolean).length ? `<div class="f">${m.foot.filter(Boolean).map(f=>`<code>${esc(f)}</code>`).join('')}</div>` : ''}
+      </div>`).join('')
+    : '<div class="empty">nothing said yet</div>';
+}
+
+function renderTasks(runs){
+  const done = runs.filter(r => !r.running).reverse();
+  document.getElementById('tasks').innerHTML = done.length ? done.slice(0,40).map(r => {
+    const bad = r.rc !== 0 || ['REVISE','BLOCK','FAILED'].includes(r.verdict);
+    return `<tr>
+      <td><b>${esc(r.agent)}</b></td>
+      <td class="faint">${esc(r.task)}</td>
+      <td>${esc(r.title||'')}</td>
+      <td><span class="chip ${r.asked?'warn':bad?'bad':'ok'}">${esc(r.verdict||'rc='+r.rc)}</span></td>
+      <td class="faint">${dur(r.secs)}</td>
+      <td class="faint">${(r.files&&r.files.length)
+          ? r.files.slice(0,4).map(f=>`<code>${esc(f)}</code>`).join(' ') + (r.files.length>4?` +${r.files.length-4}`:'')
+          : '<span class="faint">none</span>'}</td>
+      <td class="faint">${ago(r.ts)}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="7" class="empty">no completed task yet</td></tr>';
+}
+
+async function tick(){
+  const [p, bus] = await Promise.all([jsonOr('pipeline.json', null), linesOf('bus.jsonl')]);
+  const { rows, runs } = foldRuns(bus);
+  renderFlow(p);
+  renderAgents(runs);
+  renderConvo(rows, runs);
+  renderTasks(runs);
+
+  const asking = runs.filter(r => r.asked && !r.running);
+  document.getElementById('askBanner').innerHTML = asking.length
+    ? `<div class="ask"><b>❓ ${asking.length} open question${asking.length===1?'':'s'}</b> — `
+      + asking.slice(-3).map(r => `${esc(r.agent)}: ${esc(r.question)}`).join(' · ') + '</div>'
+    : '';
+  document.getElementById('sRun').textContent  = runs.filter(r=>r.running).length;
+  document.getElementById('sDone').textContent = runs.filter(r=>!r.running && r.rc===0 && !r.asked).length;
+  document.getElementById('sBad').textContent  = runs.filter(r=>!r.running && (r.rc!==0 || ['REVISE','BLOCK','FAILED'].includes(r.verdict))).length;
+  document.getElementById('sAsk').textContent  = asking.length;
+
+  const last = rows.length ? rows[rows.length-1].ts : (p && p.updatedAt);
+  const quiet = last && (Date.now() - new Date(last).getTime()) > 15*60*1000;
+  document.getElementById('pulse').className = 'pulse' + (quiet ? ' stale' : '');
+  document.getElementById('clock').textContent =
+    (last ? 'last event '+ago(last)+' ago' : 'no events') + ' · polling 1s';
+}
+
+tick(); setInterval(tick, POLL_MS);
+</script>
+</body>
+</html>

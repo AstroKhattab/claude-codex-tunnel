@@ -1,0 +1,686 @@
+#!/usr/bin/env bash
+# tunnel — hand work between Claude Code and OpenAI Codex, both ways.
+#
+# Claude runs `tunnel codex <brief>`; Codex runs `tunnel claude <brief>`. Each run
+# starts the other CLI as a real process, feeds it the brief, saves its final
+# answer as a report, and logs the run. No server, no API keys: it uses the CLIs
+# you are already signed in to.
+#
+# Written for bash 3.2 (stock macOS) and Linux. Needs: git, python3.
+set -uo pipefail
+
+VERSION="0.1.0"
+
+# ── where am I installed ────────────────────────────────────────────────────
+resolve_dir() { # directory of a path, following symlinks (no readlink -f on old macOS)
+  local p="$1" d
+  while [ -L "$p" ]; do
+    d="$(cd -P "$(dirname "$p")" && pwd)"
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  cd -P "$(dirname "$p")" && pwd
+}
+TUNNEL_HOME="${TUNNEL_HOME:-$(cd "$(resolve_dir "$0")/.." && pwd)}"
+SELF="$TUNNEL_HOME/bin/tunnel"
+
+# ── small helpers ───────────────────────────────────────────────────────────
+die()  { echo "tunnel: $*" >&2; exit 2; }
+info() { echo "$*" >&2; }
+now()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+project_root() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
+
+state_dir() {
+  local root; root="$(project_root)"
+  local s="${TUNNEL_DIR:-$root/.tunnel}"
+  mkdir -p "$s/tasks" "$s/reports" "$s/logs" "$s/threads" "$s/runs"
+  # Run state never belongs in git. A .gitignore inside the folder keeps it out
+  # without touching the project's own .gitignore.
+  [ -f "$s/.gitignore" ] || printf '*\n' > "$s/.gitignore"
+  printf '%s' "$s"
+}
+
+# Read a `key: value` line from a brief's frontmatter (first match, comment stripped).
+front() { sed -n "s/^$1:[[:space:]]*//p" "$2" 2>/dev/null | head -1 | sed 's/[[:space:]]*#.*$//; s/[[:space:]]*$//'; }
+
+task_id() { local b; b="$(basename "$1")"; b="${b%.task.md}"; printf '%s' "${b%.md}"; }
+
+json() { # json <python-expr-using-a> args...  -> prints JSON built in python
+  python3 -c "import json,sys; a=sys.argv[2:]; print(json.dumps($1))" "$@"
+}
+
+bus() { printf '%s\n' "$1" >> "$STATE/bus.jsonl"; }
+
+notify() { # notify <title> <message> [sound]
+  [ "${TUNNEL_NOTIFY:-1}" = "0" ] && return 0
+  local t="${1//\"/\'}" m="${2//\"/\'}" s="${3:-}"
+  if have osascript; then
+    if [ -n "$s" ]; then
+      osascript -e "display notification \"$m\" with title \"$t\" sound name \"$s\"" >/dev/null 2>&1 || true
+    else
+      osascript -e "display notification \"$m\" with title \"$t\"" >/dev/null 2>&1 || true
+    fi
+  elif have notify-send; then
+    notify-send "$t" "$m" >/dev/null 2>&1 || true
+  fi
+}
+
+engine_ok() {
+  case "$1" in
+    codex)  have codex  || die "the codex CLI is not on PATH (install: npm i -g @openai/codex)" ;;
+    claude) have claude || die "the claude CLI is not on PATH (install: npm i -g @anthropic-ai/claude-code)" ;;
+    *) die "unknown engine '$1' (use codex or claude)" ;;
+  esac
+}
+
+sandbox_for_role() {
+  case "$1" in
+    review|research|audit) echo read-only ;;
+    *) echo workspace-write ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+tunnel $VERSION — hand work between Claude Code and Codex, both ways.
+
+  tunnel new <slug> --to codex|claude [--role implement|review|test|research] [--title "..."]
+        Write a task brief in .tunnel/tasks/ and print its path.
+  tunnel codex  <brief.md> [--detach] [--window] [--resume <id>]
+  tunnel claude <brief.md> [--detach] [--window] [--resume <id>]
+        Run the brief on that engine. Prints the report. Exit code = engine exit code.
+        --detach  return at once with a run id; collect it later with 'tunnel wait'
+        --window  pop up a terminal that shows the Claude <-> Codex conversation live
+                  (one window per project, reused by later runs)
+        --resume  continue the same engine session (thread id in .tunnel/threads/)
+  tunnel run <brief.md> [...]        Same, engine taken from the brief's 'to:' line.
+  tunnel watch [--window]            Show the conversation live here (or in a new window).
+  tunnel wait <run-id> [--timeout <secs>]   Wait for a detached run, print its report.
+  tunnel status                      Recent and running runs.
+  tunnel dispatch [-p N] [--dry-run] <brief.md>...   Run briefs in dependency order.
+  tunnel flow init|step|note|say|status ...          Workflow steps for the board.
+  tunnel board [port]                Live board in the browser (default port 7799).
+  tunnel doctor [--live]             Check the setup (--live: ask each engine to answer).
+  tunnel version
+
+Settings (environment variables):
+  TUNNEL_CODEX_MODEL, TUNNEL_CODEX_EFFORT, TUNNEL_CODEX_PROFILE   pick the Codex model
+  TUNNEL_CLAUDE_MODEL                                             pick the Claude model
+  TUNNEL_CLAUDE_ALLOW   extra Claude tools for writing runs, e.g. "Bash(npm test:*)"
+  TUNNEL_NETWORK=1      let a writing Codex run use the network (off by default)
+  TUNNEL_WINDOW=1       always pop up the conversation window
+  TUNNEL_NOTIFY=0       no desktop notifications
+  TUNNEL_MAX_DEPTH      how deep tunnels may nest (default 2)
+  TUNNEL_DIR            where run state lives (default <project>/.tunnel)
+EOF
+}
+
+# ── new ─────────────────────────────────────────────────────────────────────
+cmd_new() {
+  local slug="" to="" role="implement" title=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) to="${2:-}"; shift 2 ;;
+      --role) role="${2:-}"; shift 2 ;;
+      --title) title="${2:-}"; shift 2 ;;
+      -*) die "unknown option $1" ;;
+      *) slug="$1"; shift ;;
+    esac
+  done
+  [ -n "$slug" ] || die "usage: tunnel new <slug> --to codex|claude [--role ...]"
+  [ -n "$to" ] || die "say who gets the brief: --to codex or --to claude"
+  case "$to" in codex|claude) ;; *) die "--to must be codex or claude" ;; esac
+  case "$role" in implement|review|test|research|audit) ;; *) die "--role must be implement, review, test or research" ;; esac
+  slug="$(printf '%s' "$slug" | tr -c 'A-Za-z0-9._-' '-' | sed 's/--*/-/g; s/^-//; s/-$//')"
+  [ -n "$title" ] || title="$(printf '%s' "$slug" | tr '-' ' ')"
+  STATE="$(state_dir)"
+  local id out
+  id="$(date +%Y%m%d-%H%M%S)-$slug"
+  out="$STATE/tasks/$id.task.md"
+  python3 - "$TUNNEL_HOME/protocol/task.template.md" "$out" "$id" "$to" "$role" \
+    "$(sandbox_for_role "$role")" "$title" <<'PY'
+import sys
+src, out, i, to, role, sb, title = sys.argv[1:]
+t = open(src).read()
+for k, v in (("<ID>", i), ("<TO>", to), ("<ROLE>", role), ("<SANDBOX>", sb), ("<TITLE>", title)):
+    t = t.replace(k, v)
+open(out, "w").write(t)
+PY
+  echo "$out"
+}
+
+# ── run ─────────────────────────────────────────────────────────────────────
+build_prompt() { # build_prompt <task> <engine>
+  local other="the orchestrator"
+  cat "$1"
+  printf '\n\n===== TUNNEL PROTOCOL (non-negotiable) =====\n'
+  printf 'You are the %s agent in this run, started by %s through claude-codex-tunnel.\n\n' "$2" "$other"
+  cat "$TUNNEL_HOME/protocol/protocol.md"
+  printf '\n## Report format (your final message, exactly these headers)\n\n'
+  cat "$TUNNEL_HOME/protocol/report.template.md"
+}
+
+run_codex() { # run_codex <prompt-file> <report> <log> <sandbox> <resume>
+  local pf="$1" report="$2" log="$3" sb="$4" resume="$5" root
+  root="$(project_root)"
+  local -a a
+  if [ -n "$resume" ]; then
+    # `codex exec resume` keeps the session's own sandbox; it takes no --sandbox.
+    a=(exec resume "$resume" --skip-git-repo-check --json -o "$report")
+  else
+    a=(exec --sandbox "$sb" -C "$root" --skip-git-repo-check --json -o "$report")
+    [ -n "${TUNNEL_CODEX_PROFILE:-}" ] && a+=(--profile "$TUNNEL_CODEX_PROFILE")
+    if [ "$sb" = "workspace-write" ]; then
+      a+=(-c "sandbox_workspace_write.writable_roots=[\"$STATE\"]")
+      [ "${TUNNEL_NETWORK:-0}" = "1" ] && a+=(-c "sandbox_workspace_write.network_access=true")
+    fi
+  fi
+  [ -n "${TUNNEL_CODEX_MODEL:-}" ] && a+=(-m "$TUNNEL_CODEX_MODEL")
+  [ -n "${TUNNEL_CODEX_EFFORT:-}" ] && a+=(-c "model_reasoning_effort=\"$TUNNEL_CODEX_EFFORT\"")
+  a+=(-)
+  # The brief goes in on stdin: it starts with '---', which argv would read as a flag.
+  codex "${a[@]}" < "$pf" > "$log" 2>&1
+  local rc=$?
+  grep -o '"\(thread_id\|session_id\|conversation_id\)": *"[^"]*"' "$log" 2>/dev/null \
+    | head -1 | sed 's/.*: *"\([^"]*\)"/\1/' > "$log.thread" || true
+  return $rc
+}
+
+run_claude() { # run_claude <prompt-file> <report> <log> <sandbox> <resume> <extra-allow>
+  local pf="$1" report="$2" log="$3" sb="$4" resume="$5" extra="${6:-}"
+  local ro="Read,Grep,Glob,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(ls:*)"
+  [ -n "${TUNNEL_CLAUDE_ALLOW:-}" ] && extra="${extra:+$extra,}$TUNNEL_CLAUDE_ALLOW"
+  local -a a
+  # stream-json: one event per line, so `tunnel watch` can show the run live.
+  a=(-p --output-format stream-json --verbose)
+  case "$sb" in
+    read-only)
+      a+=(--permission-mode default --allowedTools "$ro" --disallowedTools "Edit,Write,NotebookEdit") ;;
+    workspace-write)
+      a+=(--permission-mode acceptEdits --allowedTools "$ro,Edit,Write${extra:+,$extra}") ;;
+    danger-full-access)
+      a+=(--dangerously-skip-permissions) ;;
+  esac
+  [ -n "${TUNNEL_CLAUDE_MODEL:-}" ] && a+=(--model "$TUNNEL_CLAUDE_MODEL")
+  [ -n "$resume" ] && a+=(--resume "$resume")
+  claude "${a[@]}" < "$pf" > "$log" 2>"$log.err"
+  local rc=$?
+  python3 - "$log" "$report" "$log.thread" <<'PY' || true
+import json, sys
+log, report, thread = sys.argv[1:]
+d = {}
+for line in open(log, errors="replace"):
+    try:
+        ev = json.loads(line)
+    except Exception:
+        continue
+    if isinstance(ev, dict) and ev.get("type") == "result":
+        d = ev
+    elif isinstance(ev, dict) and ev.get("session_id") and not d:
+        d = {"session_id": ev["session_id"]}
+res = d.get("result")
+if isinstance(res, str) and res.strip():
+    open(report, "w").write(res if res.endswith("\n") else res + "\n")
+sid = d.get("session_id") or ""
+open(thread, "w").write(sid)
+PY
+  cat "$log.err" >> "$log" 2>/dev/null; rm -f "$log.err"
+  return $rc
+}
+
+watch_alive() { # a watcher is running, or one was opened in the last 15 seconds
+  local pid; pid="$(cat "$STATE/watch.pid" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+  [ -f "$STATE/watch.pid.pending" ] && python3 -c 'import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime(sys.argv[1]) < 15 else 1)' "$STATE/watch.pid.pending"
+}
+
+ensure_window() { # open the conversation window and give it a moment to start listening
+  watch_alive && return 0
+  open_window
+  local i=0
+  while [ $i -lt 10 ]; do
+    [ -f "$STATE/watch.pid" ] && kill -0 "$(cat "$STATE/watch.pid")" 2>/dev/null && return 0
+    sleep 0.5; i=$((i + 1))
+  done
+}
+
+open_window() { # open one terminal window per project that shows the live conversation
+  watch_alive && return 0
+  local root sh="$STATE/runs/watch-window.sh"
+  root="$(project_root)"
+  cat > "$sh" <<EOF
+#!/usr/bin/env bash
+printf '\\033]0;Claude ⇄ Codex tunnel\\007'
+cd "$root" && exec "$SELF" watch
+EOF
+  chmod +x "$sh"
+  : > "$STATE/watch.pid.pending"
+  if have open && [ "$(uname)" = "Darwin" ]; then
+    if [ "${TERM_PROGRAM:-}" = "iTerm.app" ] && [ -d /Applications/iTerm.app ]; then
+      open -a iTerm "$sh" >/dev/null 2>&1 && return 0
+    fi
+    open -a Terminal "$sh" >/dev/null 2>&1 && return 0
+  fi
+  for term in x-terminal-emulator gnome-terminal konsole xterm; do
+    if have "$term"; then
+      case "$term" in
+        gnome-terminal) "$term" -- "$sh" >/dev/null 2>&1 & ;;
+        *) "$term" -e "$sh" >/dev/null 2>&1 & ;;
+      esac
+      return 0
+    fi
+  done
+  info "no terminal app found for --window; watch in any terminal with: tunnel watch"
+}
+
+cmd_watch() {
+  local window=0 rid="" from=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --window) window=1; shift ;;
+      --run) rid="${2:-}"; shift 2 ;;
+      --from-start) from=--from-start; shift ;;
+      *) die "usage: tunnel watch [--window] [--run <run-id>] [--from-start]" ;;
+    esac
+  done
+  STATE="$(state_dir)"
+  if [ "$window" = 1 ]; then
+    if watch_alive; then echo "the conversation window is already open"; else open_window; echo "opened the conversation window"; fi
+    return 0
+  fi
+  local -a a=("$STATE")
+  [ -n "$rid" ] && a+=(--run "$rid")
+  [ -n "$from" ] && a+=("$from")
+  if [ -z "$rid" ]; then
+    echo $$ > "$STATE/watch.pid"; rm -f "$STATE/watch.pid.pending"
+  fi
+  exec python3 "$TUNNEL_HOME/lib/watch.py" "${a[@]}"
+}
+
+cmd_run() {
+  local task="" engine="" resume="" detach=0 window=0 rid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) engine="${2:-}"; shift 2 ;;
+      --resume) resume="${2:-}"; shift 2 ;;
+      --detach) detach=1; shift ;;
+      --window) window=1; shift ;;
+      --run-id) rid="${2:-}"; shift 2 ;;   # internal
+      -*) die "unknown option $1" ;;
+      *) task="$1"; shift ;;
+    esac
+  done
+  [ -n "$task" ] || die "usage: tunnel codex|claude <brief.md>"
+  [ -f "$task" ] || die "brief not found: $task"
+  task="$(cd "$(dirname "$task")" && pwd)/$(basename "$task")"
+  [ -n "$engine" ] || engine="$(front to "$task")"
+  [ -n "$engine" ] || die "no engine: use 'tunnel codex <brief>' or put 'to: codex' in the brief"
+  engine_ok "$engine"
+
+  # Nesting guard: Claude -> Codex -> Claude -> ... must end somewhere.
+  local depth="${TUNNEL_DEPTH:-0}" max="${TUNNEL_MAX_DEPTH:-2}"
+  [ "$depth" -ge "$max" ] && die "refused: tunnel depth $depth reached TUNNEL_MAX_DEPTH=$max (a tunnel inside a tunnel inside a tunnel)"
+
+  STATE="$(state_dir)"
+  local id; id="$(task_id "$task")"
+  [ -n "$rid" ] || rid="$id.$engine.$(date +%s)"
+
+  # The window is opened before the run starts, so it shows the brief going out.
+  if [ "$window" = 1 ] || [ "${TUNNEL_WINDOW:-0}" = 1 ]; then ensure_window; fi
+  if [ "$detach" = 1 ]; then
+    local -a fwd=(run "$task" --to "$engine" --run-id "$rid")
+    [ -n "$resume" ] && fwd+=(--resume "$resume")
+    TUNNEL_WINDOW=0 nohup "$SELF" "${fwd[@]}" > "$STATE/runs/$rid.out" 2>&1 < /dev/null &
+    echo "run: $rid"
+    echo "report (when done): $STATE/reports/$id.$engine.report.md"
+    echo "collect it with: tunnel wait $rid"
+    return 0
+  fi
+
+  local report="$STATE/reports/$id.$engine.report.md"
+  local log="$STATE/logs/$id.$engine.jsonl"
+  local pf="$STATE/runs/$rid.prompt.md"
+  local sb role title goal
+  sb="$(front sandbox "$task")"
+  role="$(front role "$task")"; role="${role:-implement}"
+  case "$sb" in workspace-write|read-only|danger-full-access) ;; *) sb="$(sandbox_for_role "$role")" ;; esac
+  title="$(front title "$task")"; [ -n "$title" ] || title="$(printf '%s' "$id" | sed 's/^[0-9]\{8\}-[0-9]\{4,6\}-//; s/-/ /g')"
+  goal="$(sed -n '/^## Goal/,/^## /p' "$task" | sed '1d;/^## /d' | tr -s ' \n' ' ' | cut -c1-200)"
+  rm -f "$report" "$STATE/runs/$rid.done"
+  build_prompt "$task" "$engine" > "$pf"
+
+  local root before; root="$(project_root)"
+  before="$(cd "$root" && git status --porcelain 2>/dev/null | sort)"
+
+  # Who is asking: the engine of an outer tunnel run, else Claude Code (it sets
+  # CLAUDECODE=1 for its shell), else Codex (it sets CODEX_* variables), else you.
+  local caller=you
+  if [ -n "${TUNNEL_ENGINE:-}" ]; then caller="$TUNNEL_ENGINE"
+  elif [ "${CLAUDECODE:-}" = 1 ]; then caller=claude
+  elif env | grep -v '^CODEX_HOME=' | grep -q '^CODEX_'; then caller=codex
+  fi
+
+  bus "$(json '{"ts":a[0],"event":"start","run":a[1],"agent":a[2],"title":a[3],"role":a[4],"task":a[5],"brief":a[6],"sandbox":a[7],"resumed":a[8]=="1","goal":a[9],"depth":int(a[10]),"from":a[11]}' \
+    "$(now)" "$rid" "$engine" "$title" "$role" "$id" "${task#$root/}" "$sb" "$([ -n "$resume" ] && echo 1 || echo 0)" "$goal" "$depth" "$caller")"
+  info "▶ $engine · $title · sandbox=$sb"
+  notify "→ $engine started" "$title"
+
+  local start rc; start=$(date +%s)
+  local outer="${TUNNEL_ENGINE:-}"
+  export TUNNEL_DEPTH=$((depth + 1)) TUNNEL_ENGINE="$engine"
+  if [ "$engine" = codex ]; then
+    run_codex "$pf" "$report" "$log" "$sb" "$resume"; rc=$?
+  else
+    run_claude "$pf" "$report" "$log" "$sb" "$resume" "$(front allow "$task")"; rc=$?
+  fi
+  export TUNNEL_DEPTH=$depth TUNNEL_ENGINE="$outer"
+
+  local thread=""; [ -s "$log.thread" ] && thread="$(cat "$log.thread")"
+  rm -f "$log.thread"
+  [ -n "$thread" ] && printf '%s\n' "$thread" > "$STATE/threads/$id.$engine"
+
+  local verdict=""
+  [ -s "$report" ] && verdict="$(grep -m1 -i '^## *Verdict' "$report" | sed 's/.*: *//' | awk '{print toupper($1)}' | tr -d '\r')"
+  if [ -z "$verdict" ]; then
+    if [ "$rc" -ne 0 ] || [ ! -s "$report" ]; then verdict=FAILED; else verdict=UNKNOWN; fi
+  fi
+  if [ ! -s "$report" ]; then
+    { echo "## Verdict: FAILED"; echo; echo "## Summary"; echo "The $engine run produced no report (exit code $rc). Last lines of the log:"; echo; echo '```'; tail -n 25 "$log" 2>/dev/null; echo '```'; } > "$report"
+  fi
+
+  local questions asked qsum
+  questions="$(sed -n '/^## *Open questions/,/^## /p' "$report" | sed '1d;/^## /d;/^[[:space:]]*$/d' \
+    | grep -viE '^[[:space:]]*[-*]?[[:space:]]*(none|n/?a|no( open)? questions)\.?[[:space:]]*$' || true)"
+  asked=0; [ -n "$questions" ] && asked=1
+  qsum="$(printf '%s' "$questions" | tr -s ' \n' ' ' | cut -c1-160)"
+
+  # Files touched are measured from git, not self-reported.
+  local after files
+  after="$(cd "$root" && git status --porcelain 2>/dev/null | sort)"
+  files="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") 2>/dev/null | sed 's/^...//' | grep -v '^\.tunnel/' | head -40 || true)"
+
+  bus "$(json '{"ts":a[0],"event":"end","run":a[1],"agent":a[2],"title":a[3],"task":a[4],"verdict":a[5],"rc":int(a[6]),"secs":int(a[7]),"sandbox":a[8],"thread":a[9],"asked":a[10]=="1","question":a[11],"files":[l for l in a[12].splitlines() if l.strip()],"report":a[13]}' \
+    "$(now)" "$rid" "$engine" "$title" "$id" "$verdict" "$rc" "$(( $(date +%s) - start ))" "$sb" "$thread" "$asked" "$qsum" "$files" "${report#$root/}")"
+  printf '%s rc=%s\n' "$verdict" "$rc" > "$STATE/runs/$rid.done"
+
+  info "◀ $engine · verdict=$verdict · rc=$rc"
+  info "report: $report"
+  [ -n "$thread" ] && info "resume: tunnel $engine <brief> --resume $thread"
+  if [ "$asked" = 1 ]; then
+    notify "❓ $engine has a question" "$qsum" "Submarine"
+  elif [ "$rc" -ne 0 ] || [ "$verdict" = REVISE ] || [ "$verdict" = BLOCK ] || [ "$verdict" = FAILED ]; then
+    notify "← $engine: $verdict" "$title" "Basso"
+  else
+    notify "← $engine: $verdict" "$title"
+  fi
+  cat "$report"
+  [ -n "$(tail -c 1 "$report")" ] && echo
+  return "$rc"
+}
+
+# ── wait ────────────────────────────────────────────────────────────────────
+cmd_wait() {
+  local rid="" timeout=540
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout) timeout="${2:-540}"; shift 2 ;;
+      *) rid="$1"; shift ;;
+    esac
+  done
+  [ -n "$rid" ] || die "usage: tunnel wait <run-id> [--timeout secs]"
+  STATE="$(state_dir)"
+  local waited=0
+  while [ ! -f "$STATE/runs/$rid.done" ]; do
+    if [ "$timeout" -gt 0 ] && [ "$waited" -ge "$timeout" ]; then
+      echo "still running after ${timeout}s — call 'tunnel wait $rid' again"
+      return 124
+    fi
+    sleep 3; waited=$((waited + 3))
+  done
+  local id engine rest
+  rest="${rid%.*}"; engine="${rest##*.}"; id="${rest%.*}"
+  cat "$STATE/reports/$id.$engine.report.md" 2>/dev/null
+  local rc; rc="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' "$STATE/runs/$rid.done")"
+  return "${rc:-0}"
+}
+
+# ── status ──────────────────────────────────────────────────────────────────
+cmd_status() {
+  STATE="$(state_dir)"
+  [ -s "$STATE/bus.jsonl" ] || { echo "no runs yet in $STATE"; return 0; }
+  python3 - "$STATE/bus.jsonl" <<'PY'
+import json, sys, time, calendar
+rows = []
+for l in open(sys.argv[1]):
+    try: rows.append(json.loads(l))
+    except Exception: pass
+runs = {}
+for r in rows:
+    if r.get("event") in ("start", "end") and r.get("run"):
+        runs.setdefault(r["run"], {}).update(r)
+        runs[r["run"]]["_" + r["event"]] = True
+live = [r for r in runs.values() if not r.get("_end")]
+done = [r for r in runs.values() if r.get("_end")][-15:]
+def ago(ts):
+    try: s = int(time.time() - calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
+    except Exception: return "?"
+    return f"{s}s" if s < 60 else f"{s//60}m" if s < 3600 else f"{s//3600}h"
+print(f"running: {len(live)}")
+for r in live:
+    print(f"  ▶ {r['agent']:<6} {r.get('title','')[:50]:<50} started {ago(r['ts'])} ago   run={r['run']}")
+print("recent:")
+for r in reversed(done):
+    q = "  ❓ " + r.get("question","") if r.get("asked") else ""
+    print(f"  {r.get('verdict','?'):<8} {r['agent']:<6} {r.get('title','')[:50]:<50} {r.get('secs',0)}s  {ago(r['ts'])} ago{q}")
+PY
+}
+
+# ── dispatch ────────────────────────────────────────────────────────────────
+cmd_dispatch() {
+  local par=1 dry=0 tasks=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p|--parallel) par="$2"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      --queue) while IFS= read -r line; do case "$line" in ''|\#*) continue ;; esac; tasks="$tasks$line
+"; done < "$2"; shift 2 ;;
+      *) tasks="$tasks$1
+"; shift ;;
+    esac
+  done
+  [ -n "$tasks" ] || die "usage: tunnel dispatch [-p N] [--dry-run] <brief.md>... | --queue <file>"
+  STATE="$(state_dir)"
+
+  verdict_of() { # latest verdict for a task id
+    local latest v
+    latest="$(ls -t "$STATE/reports/$1".*.report.md 2>/dev/null | head -1)"
+    [ -n "$latest" ] || { echo NONE; return; }
+    v="$(grep -m1 -i '^## *Verdict' "$latest" | sed 's/.*: *//' | awk '{print toupper($1)}')"
+    echo "${v:-NONE}"
+  }
+
+  local remaining="$tasks" wave=0 planned=""
+  while [ -n "$(printf '%s' "$remaining" | tr -d '[:space:]')" ]; do
+    wave=$((wave + 1))
+    local ready="" blocked="" t d ok
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      ok=1
+      for d in $(front depends_on "$t" | tr ',' ' '); do
+        case "$d" in none|-|'') continue ;; esac
+        case "$(verdict_of "$d")" in DONE|APPROVE) continue ;; esac
+        # In a dry run, a dependency planned in an earlier wave counts as met.
+        case " $planned " in *" $d "*) [ "$dry" = 1 ] && continue ;; esac
+        ok=0
+      done
+      if [ "$ok" = 1 ]; then ready="$ready$t
+"; else blocked="$blocked$t
+"; fi
+    done <<EOF
+$remaining
+EOF
+    if [ -z "$(printf '%s' "$ready" | tr -d '[:space:]')" ]; then
+      info "✗ wave $wave: nothing can run — unmet or failed dependencies:"; info "$blocked"; return 1
+    fi
+    echo "── wave $wave ──"
+    local n=0
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      echo "   $(front to "$t")  <-  $(task_id "$t")"
+      planned="$planned $(task_id "$t")"
+      [ "$dry" = 1 ] && continue
+      "$SELF" run "$t" >/dev/null 2>&1 &
+      n=$((n + 1)); [ "$n" -ge "$par" ] && { wait; n=0; }
+    done <<EOF
+$ready
+EOF
+    wait
+    if [ "$dry" = 1 ]; then remaining="$blocked"; continue; fi
+    local halt=0 i v
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      i="$(task_id "$t")"; v="$(verdict_of "$i")"; echo "   $i -> $v"
+      case "$v" in DONE|APPROVE) ;; *) halt=1 ;; esac
+    done <<EOF
+$ready
+EOF
+    [ "$halt" = 1 ] && { info "✗ halted: a task returned REVISE/BLOCK/FAILED. Read the reports and decide."; return 1; }
+    remaining="$blocked"
+  done
+  echo "✓ all tasks DONE/APPROVE"
+}
+
+# ── flow (workflow steps shown on the board) ────────────────────────────────
+cmd_flow() {
+  STATE="$(state_dir)"
+  local pipe="$STATE/pipeline.json" c="${1:-status}"; shift || true
+  case "$c" in
+    init)
+      python3 - "$pipe" "$(now)" "$@" <<'PY'
+import json, sys
+pipe, ts, title, *specs = sys.argv[1:] + ([] if len(sys.argv) > 3 else ["Run"])
+steps = []
+for s in specs:
+    i, _, label = s.partition(":")
+    steps.append({"id": i, "label": label or i, "status": "todo", "detail": "", "at": None})
+json.dump({"title": title, "startedAt": ts, "updatedAt": ts, "steps": steps}, open(pipe + ".tmp", "w"), indent=2)
+PY
+      mv "$pipe.tmp" "$pipe"
+      bus "$(json '{"ts":a[0],"event":"flow-init","title":a[1]}' "$(now)" "${1:-Run}")"
+      echo "pipeline: $pipe" ;;
+    step)
+      local sid="${1:?step id}" st="${2:?todo|doing|done|blocked}"; shift 2
+      [ -f "$pipe" ] || die "no pipeline yet: tunnel flow init \"Title\" s1:\"Step one\" ..."
+      python3 - "$pipe" "$sid" "$st" "$*" "$(now)" <<'PY'
+import json, sys
+pipe, sid, st, detail, ts = sys.argv[1:]
+p = json.load(open(pipe))
+hit = [s for s in p["steps"] if s["id"] == sid]
+if not hit:
+    p["steps"].append({"id": sid, "label": sid, "status": st, "detail": detail, "at": ts})
+for s in hit:
+    s["status"], s["at"] = st, ts
+    if detail: s["detail"] = detail
+p["updatedAt"] = ts
+json.dump(p, open(pipe + ".tmp", "w"), indent=2)
+PY
+      mv "$pipe.tmp" "$pipe"
+      bus "$(json '{"ts":a[0],"event":"step","step":a[1],"status":a[2],"detail":a[3]}' "$(now)" "$sid" "$st" "$*")"
+      info "· $sid → $st${*:+ — $*}" ;;
+    note) bus "$(json '{"ts":a[0],"event":"note","from":"orchestrator","text":a[1]}' "$(now)" "$*")" ;;
+    say)
+      local to="${1:?to}"; shift
+      bus "$(json '{"ts":a[0],"event":"say","from":"orchestrator","to":a[1],"text":a[2]}' "$(now)" "$to" "$*")"
+      info "→ $to: $*" ;;
+    status)
+      [ -f "$pipe" ] || { echo "no pipeline yet"; return 0; }
+      python3 - "$pipe" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1])); mark = {"todo": "·", "doing": "▶", "done": "✓", "blocked": "✗"}
+print(p["title"])
+for s in p["steps"]:
+    print(" %s %-8s %-28s %s" % (mark.get(s["status"], "?"), s["status"], s["label"], s.get("detail", "")))
+PY
+      ;;
+    *) die "usage: tunnel flow init|step|note|say|status" ;;
+  esac
+}
+
+# ── board ───────────────────────────────────────────────────────────────────
+cmd_board() {
+  local port="${1:-7799}"
+  STATE="$(state_dir)"
+  mkdir -p "$STATE/board"
+  cp "$TUNNEL_HOME/board/index.html" "$STATE/board/index.html"
+  touch "$STATE/bus.jsonl"
+  # http.server will not serve above its root, so the two data files are linked in.
+  ln -sf ../bus.jsonl "$STATE/board/bus.jsonl"
+  ln -sf ../pipeline.json "$STATE/board/pipeline.json"
+  echo "board: http://localhost:$port/   (ctrl-c to stop)"
+  exec python3 -m http.server "$port" --bind 127.0.0.1 --directory "$STATE/board"
+}
+
+# ── doctor ──────────────────────────────────────────────────────────────────
+cmd_doctor() {
+  local bad=0
+  ok()   { printf '  ✓ %s\n' "$*"; }
+  warn() { printf '  ! %s\n' "$*"; }
+  fail() { printf '  ✗ %s\n' "$*"; bad=1; }
+  echo "tunnel $VERSION at $TUNNEL_HOME"
+  have git && ok "git" || fail "git is missing"
+  have python3 && ok "python3" || fail "python3 is missing"
+  if have tunnel; then ok "tunnel is on PATH"; else warn "tunnel is not on PATH (add the install folder to PATH)"; fi
+  if have codex; then
+    ok "codex $(codex --version 2>/dev/null | head -1)"
+    if codex login status >/dev/null 2>&1; then ok "codex is signed in"; else warn "codex may not be signed in (run: codex login)"; fi
+  else warn "codex CLI not found (npm i -g @openai/codex) — Claude cannot send work to Codex"; fi
+  if have claude; then ok "claude $(claude --version 2>/dev/null | head -1)"
+  else warn "claude CLI not found (npm i -g @anthropic-ai/claude-code) — Codex cannot send work to Claude"; fi
+  local cdir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" root; root="$(project_root)"
+  if [ -f "$cdir/skills/claude-codex-tunnel/SKILL.md" ]; then ok "Claude skill installed (user)"
+  elif [ -f "$root/.claude/skills/claude-codex-tunnel/SKILL.md" ]; then ok "Claude skill installed (this project)"
+  else warn "Claude skill not installed (run install.sh)"; fi
+  if [ -f "$HOME/.agents/skills/claude-codex-tunnel/SKILL.md" ]; then ok "Codex skill installed (user)"
+  elif [ -f "$root/.agents/skills/claude-codex-tunnel/SKILL.md" ]; then ok "Codex skill installed (this project)"
+  else warn "Codex skill not installed (run install.sh)"; fi
+  if [ "${1:-}" = "--live" ]; then
+    echo "live check (spends a little credit on each engine):"
+    local out
+    if have codex; then
+      local -a ca=(exec --sandbox read-only --skip-git-repo-check)
+      [ -n "${TUNNEL_CODEX_MODEL:-}" ] && ca+=(-m "$TUNNEL_CODEX_MODEL")
+      out="$(echo "Reply with exactly: TUNNEL-OK" | codex "${ca[@]}" - 2>&1)"
+      if printf '%s' "$out" | grep -q 'TUNNEL-OK'; then ok "codex answered"
+      else fail "codex did not answer: $(printf '%s' "$out" | grep -iE 'error|not supported|login' | head -2 | cut -c1-200)"
+           printf '      if the model is the problem, set TUNNEL_CODEX_MODEL to one your plan allows\n'; fi
+    fi
+    if have claude; then
+      local -a la=(-p)
+      [ -n "${TUNNEL_CLAUDE_MODEL:-}" ] && la+=(--model "$TUNNEL_CLAUDE_MODEL")
+      out="$(echo "Reply with exactly: TUNNEL-OK" | claude "${la[@]}" 2>&1)"
+      if printf '%s' "$out" | grep -q 'TUNNEL-OK'; then ok "claude answered"
+      else fail "claude did not answer: $(printf '%s' "$out" | head -2 | cut -c1-200)"; fi
+    fi
+  fi
+  [ "$bad" = 0 ] && echo "ready." || { echo "fix the ✗ lines above."; return 1; }
+}
+
+# ── main ────────────────────────────────────────────────────────────────────
+c="${1:-help}"; shift || true
+case "$c" in
+  new)           cmd_new "$@" ;;
+  codex|claude)  cmd_run --to "$c" "$@" ;;
+  run)           cmd_run "$@" ;;
+  wait)          cmd_wait "$@" ;;
+  status|ls)     cmd_status ;;
+  dispatch)      cmd_dispatch "$@" ;;
+  flow)          cmd_flow "$@" ;;
+  board)         cmd_board "$@" ;;
+  doctor)        cmd_doctor "$@" ;;
+  watch)         cmd_watch "$@" ;;
+  version|-v|--version) echo "tunnel $VERSION" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac
